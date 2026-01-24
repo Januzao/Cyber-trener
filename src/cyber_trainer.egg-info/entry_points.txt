@@ -1,0 +1,3 @@
+[console_scripts]
+cyber-trainer = cyber_trainer.main:main
+cyber-trainer-server = cyber_trainer.server:main

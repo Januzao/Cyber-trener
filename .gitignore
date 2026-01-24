@@ -1,0 +1,22 @@
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.log
+*.env
+
+# node / vite
+node_modules/
+dist/
+build/
+
+#project runtime
+
+sessions/
+*.jsonl
+
+#os
+
+.DS.Store
+Thumbs.db

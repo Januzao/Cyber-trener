@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cyber-trainer"
+version = "0.1.0"
+description = "Simplest MVP: 2x MJPEG streams + MediaPipe Pose + deadlift hints (voice)"
+readme = "README.md"
+requires-python = ">=3.11,<3.12"
+dependencies = [
+  "numpy>=1.24",
+  "opencv-python>=4.8",
+  "mediapipe>=0.10.14",
+  "requests>=2.31",
+  "pyttsx3>=2.90",
+  "fastapi>=0.110",
+  "uvicorn[standard]>=0.29"
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=7.4"
+]
+
+[project.scripts]
+cyber-trainer = "cyber_trainer.main:main"
+cyber-trainer-server = "cyber_trainer.server:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]

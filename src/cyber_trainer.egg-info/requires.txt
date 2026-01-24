@@ -1,0 +1,10 @@
+numpy>=1.24
+opencv-python>=4.8
+mediapipe>=0.10.14
+requests>=2.31
+pyttsx3>=2.90
+fastapi>=0.110
+uvicorn[standard]>=0.29
+
+[dev]
+pytest>=7.4
