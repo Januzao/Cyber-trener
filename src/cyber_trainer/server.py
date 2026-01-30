@@ -29,6 +29,23 @@ from .summary import SessionSummary, save_summary
 from .video_stream import LatestFrameGrabber
 
 
+import os
+
+import numpy as np
+
+try:
+    import torch
+except Exception:  # pragma: no cover
+    torch = None  # type: ignore
+
+try:
+    # Reuse the exact architecture used during training.
+    from .ml.train_squat_pairs import SquatFormTCN
+except Exception:  # pragma: no cover
+    SquatFormTCN = None  # type: ignore
+
+
+
 def _pose_to_keypoints(pose: PoseResult) -> List[Dict[str, Any]]:
     # UI expects: {x, y, confidence, label}
     out: List[Dict[str, Any]] = []
@@ -74,6 +91,217 @@ ISSUE_TO_ERRORS: Dict[str, List[str]] = {
     "BI_TOP_ROM": ["left_wrist", "right_wrist", "left_elbow", "right_elbow"],
     "BI_BOTTOM_ROM": ["left_wrist", "right_wrist", "left_elbow", "right_elbow"],
 }
+
+
+
+# ------------------------------------------------------------
+# Squat ML (correct/incorrect) — trained on your own videos
+# ------------------------------------------------------------
+MP_LABELS_33: List[str] = [
+    "nose",
+    "left_eye_inner", "left_eye", "left_eye_outer",
+    "right_eye_inner", "right_eye", "right_eye_outer",
+    "left_ear", "right_ear",
+    "mouth_left", "mouth_right",
+    "left_shoulder", "right_shoulder",
+    "left_elbow", "right_elbow",
+    "left_wrist", "right_wrist",
+    "left_pinky", "right_pinky",
+    "left_index", "right_index",
+    "left_thumb", "right_thumb",
+    "left_hip", "right_hip",
+    "left_knee", "right_knee",
+    "left_ankle", "right_ankle",
+    "left_heel", "right_heel",
+    "left_foot_index", "right_foot_index",
+]
+
+# indices used by MediaPipe Pose
+_L_SH, _R_SH = 11, 12
+_L_HIP, _R_HIP = 23, 24
+
+
+def _pose_to_np_xy_vis(pose: PoseResult) -> tuple[Optional[np.ndarray], Optional[np.ndarray]]:
+    """Return (xy, vis) in MediaPipe landmark order.
+
+    xy: (33,2)  vis: (33,1)
+    """
+    if not pose.ok:
+        return None, None
+
+    xy = np.zeros((33, 2), dtype=np.float32)
+    vis = np.zeros((33, 1), dtype=np.float32)
+
+    for i, name in enumerate(MP_LABELS_33):
+        p = pose.landmarks.get(name)
+        if p is None:
+            continue
+        xy[i, 0] = float(p.x)
+        xy[i, 1] = float(p.y)
+        vis[i, 0] = float(p.vis)
+
+    return xy, vis
+
+
+def _normalize_xy_vis(xy: np.ndarray, vis: np.ndarray) -> np.ndarray:
+    """Normalize as in dataset builder: center at hip, scale by shoulder width."""
+    hip_center = (xy[_L_HIP] + xy[_R_HIP]) / 2.0
+    xy2 = xy - hip_center
+
+    sh_dist = float(np.linalg.norm(xy2[_L_SH] - xy2[_R_SH]) + 1e-6)
+    hip_dist = float(np.linalg.norm(xy2[_L_HIP] - xy2[_R_HIP]) + 1e-6)
+    scale = sh_dist if sh_dist > 1e-3 else hip_dist
+    xy2 = xy2 / scale
+
+    return np.concatenate([xy2.astype(np.float32), vis.astype(np.float32)], axis=1)  # (33,3) -> x,y,vis
+
+
+class _FeatState:
+    def __init__(self) -> None:
+        self.prev_xy: Optional[np.ndarray] = None  # (33,2) normalized
+
+
+def _to_feat33x5(xy: np.ndarray, vis: np.ndarray, st: _FeatState) -> tuple[np.ndarray, float]:
+    """Build features (33,5) = x,y,vis,vx,vy + motion proxy."""
+    base = _normalize_xy_vis(xy, vis)  # (33,3)
+    nxy = base[:, :2]
+
+    if st.prev_xy is None:
+        v = np.zeros_like(nxy, dtype=np.float32)
+    else:
+        v = (nxy - st.prev_xy).astype(np.float32)
+
+    st.prev_xy = nxy.copy()
+
+    feat = np.concatenate([base, v], axis=1).astype(np.float32)  # (33,5)
+    motion = float(np.mean(np.abs(v)))
+    return feat, motion
+
+
+def _safe_torch_load(path: str):
+    if torch is None:
+        return None
+    try:
+        return torch.load(path, map_location="cpu", weights_only=True)  # type: ignore[arg-type]
+    except TypeError:
+        return torch.load(path, map_location="cpu")
+    except Exception:
+        return None
+
+
+class SquatMlRuntime:
+    """Realtime inference wrapper for squat_form.pt.
+
+    - keeps a sliding window for front + side
+    - outputs p(correct) in [0,1]
+    - provides an EMA-smoothed score (0..100)
+    """
+
+    def __init__(self, ckpt_path: str, window_default: int = 45) -> None:
+        self.enabled = False
+        self.window = int(window_default)
+        self.in_dim = 0
+
+        self._model = None
+        self._buf_f: List[np.ndarray] = []
+        self._buf_s: List[np.ndarray] = []
+
+        self._front_st = _FeatState()
+        self._side_st = _FeatState()
+
+        self._ema = 0.0
+
+        if torch is None or SquatFormTCN is None:
+            return
+
+        ckpt = _safe_torch_load(ckpt_path)
+        if not isinstance(ckpt, dict):
+            return
+
+        try:
+            self.window = int(ckpt.get("window", window_default))
+            self.in_dim = int(ckpt.get("in_dim", 0))
+            model = SquatFormTCN(in_dim=self.in_dim)
+            model.load_state_dict(ckpt["model_state"], strict=True)
+            model.eval()
+            self._model = model
+            self.enabled = True
+        except Exception:
+            self.enabled = False
+            self._model = None
+
+    def reset(self) -> None:
+        self._buf_f = []
+        self._buf_s = []
+        self._front_st = _FeatState()
+        self._side_st = _FeatState()
+        self._ema = 0.0
+
+    def _push(self, feat_f: np.ndarray, feat_s: np.ndarray) -> None:
+        self._buf_f.append(feat_f.reshape(-1).astype(np.float32))
+        self._buf_s.append(feat_s.reshape(-1).astype(np.float32))
+        if len(self._buf_f) > self.window:
+            self._buf_f.pop(0)
+        if len(self._buf_s) > self.window:
+            self._buf_s.pop(0)
+
+    def ready(self) -> bool:
+        return self.enabled and len(self._buf_f) == self.window and len(self._buf_s) == self.window
+
+    def update(
+        self,
+        front_pose: PoseResult,
+        side_pose: PoseResult,
+        *,
+        is_active: bool,
+        match_ok: bool,
+        motion_gate_ok: bool,
+    ) -> tuple[int, str, Optional[float], bool]:
+        """Return (score0_100, status, p_correct, incorrect)."""
+        if not self.enabled:
+            return 0, "neutral", None, False
+
+        xy_f, vis_f = _pose_to_np_xy_vis(front_pose)
+        xy_s, vis_s = _pose_to_np_xy_vis(side_pose)
+
+        if xy_f is None or xy_s is None or vis_f is None or vis_s is None:
+            # No pose -> decay to 0
+            self._ema = 0.85 * self._ema
+            return int(round(100.0 * self._ema)), "neutral", None, False
+
+        feat_f, motion_f = _to_feat33x5(xy_f, vis_f, self._front_st)
+        feat_s, motion_s = _to_feat33x5(xy_s, vis_s, self._side_st)
+
+        self._push(feat_f, feat_s)
+
+        # If user selected squat but is doing something else (classifier mismatch), force score down.
+        if not match_ok:
+            self._ema = 0.70 * self._ema
+            return int(round(100.0 * self._ema)), "neutral", None, False
+
+        # Only score when the session is active AND motion gate says "moving".
+        if not (is_active and motion_gate_ok and self.ready()):
+            self._ema = 0.90 * self._ema
+            return int(round(100.0 * self._ema)), "neutral", None, False
+
+        assert self._model is not None
+
+        wf = np.stack(self._buf_f, axis=0)
+        ws = np.stack(self._buf_s, axis=0)
+        x = np.concatenate([wf, ws], axis=1).astype(np.float32)  # (W,F)
+
+        xt = torch.from_numpy(x).unsqueeze(0)
+        with torch.no_grad():
+            logit = float(self._model(xt).squeeze(0).item())
+        p = float(1.0 / (1.0 + np.exp(-logit)))
+
+        # EMA smoothing for UI scale
+        alpha = 0.25
+        self._ema = (1.0 - alpha) * self._ema + alpha * p
+
+        status = "good" if p >= 0.5 else "bad"
+        incorrect = bool(p < 0.5)
+        return int(round(100.0 * self._ema)), status, p, incorrect
 
 
 def _severity_rank(sev: str) -> int:
@@ -168,6 +396,9 @@ class EngineThread(threading.Thread):
         self.motion_gate = MotionGate(min_vis=cfg.min_pose_visibility, active_frames=4, inactive_ms=900)
         self.score_tracker = FormScoreTracker()
 
+        # Squat ML model (optional)
+        self.squat_ml = SquatMlRuntime(ckpt_path=os.path.join(os.getcwd(), 'models', 'squat_form.pt'))
+
         # hinting (global rate-limit + per-issue cooldown)
         self.hint_mgr = HintManager(
             enable_voice=cfg.enable_voice,
@@ -216,6 +447,14 @@ class EngineThread(threading.Thread):
             self.rep_counter.reset()
             self.motion_gate.reset()
             self.score_tracker.reset()
+            try:
+                self.squat_ml.reset()
+            except Exception:
+                pass
+            try:
+                self.squat_ml.reset()
+            except Exception:
+                pass
             self.biceps_engine.reset()
 
     def stop_session(self) -> Optional[str]:
@@ -294,7 +533,7 @@ class EngineThread(threading.Thread):
                         "front": {"ok": False, "avg_vis": 0.0, "keypoints": [], "errors": [], "frame_w": 0, "frame_h": 0, "mjpeg": self.cfg.front_url},
                         "side": {"ok": False, "avg_vis": 0.0, "keypoints": [], "errors": [], "frame_w": 0, "frame_h": 0, "mjpeg": self.cfg.side_url},
                     },
-                    "form": {"status": "neutral", "message": "Очікування потоків камер…", "score": 0},
+                    "form": {"status": "neutral", "message": "Очікування потоків камер…", "score": 0, "pose_color": "green", "ml": {"enabled": False}},
                     "reps": asdict(self.rep_counter.state),
                 }
                 self.last_state = payload
@@ -389,6 +628,52 @@ class EngineThread(threading.Thread):
                 analyzing_message=analyzing_msg,
             )
 
+
+            # ------------------------------------------------------------
+            # Optional: ML-based squat technique score (trained on your data)
+            # ------------------------------------------------------------
+            form_status = score_state.status
+            form_message = score_state.message
+            form_score = int(score_state.score)
+
+            ml_info: Dict[str, Any] = {"enabled": False}
+            ml_incorrect = False
+
+            if eval_ex == "squat" and getattr(self, "squat_ml", None) is not None and self.squat_ml.enabled:
+                # If user forced "squat" but classifier thinks it's NOT squat -> decay score.
+                match_ok = True
+                if self.classifier.forced == "squat":
+                    match_ok = (guess.name == "squat" and float(guess.confidence) >= 0.55)
+
+                ml_score, ml_status, ml_p, ml_incorrect = self.squat_ml.update(
+                    front_pose,
+                    side_pose,
+                    is_active=is_active,
+                    match_ok=match_ok,
+                    motion_gate_ok=bool(act.active),
+                )
+
+                ml_info = {
+                    "enabled": True,
+                    "p_correct": None if ml_p is None else float(ml_p),
+                    "status": str(ml_status),
+                    "score": int(ml_score),
+                    "match_ok": bool(match_ok),
+                }
+
+                # Override the UI score with ML output
+                form_score = int(ml_score)
+                if ml_p is None:
+                    form_status = "neutral"
+                    form_message = analyzing_msg
+                else:
+                    form_status = "good" if ml_p >= 0.5 else "bad"
+                    form_message = f"ML техніка присідання: {form_score}/100"
+
+            # If ML says incorrect squat, highlight the whole skeleton in red (fallback via 'errors')
+            if ml_incorrect:
+                errors = list(MP_LABELS_33)
+
             payload = {
                 "type": "state",
                 "ts_ms": int(ts_ms),
@@ -423,9 +708,11 @@ class EngineThread(threading.Thread):
                     },
                 },
                 "form": {
-                    "status": score_state.status,
-                    "message": score_state.message,
-                    "score": int(score_state.score),
+                    "status": form_status,
+                    "message": form_message,
+                    "score": int(form_score),
+                    "pose_color": "red" if ml_incorrect else "green",
+                    "ml": ml_info,
                 },
                 "reps": asdict(self.rep_counter.state),
             }

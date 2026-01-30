@@ -1,22 +1,43 @@
-.venv/
-__pycache__/
-*.pyc
-*.pyo
-*.pyd
-*.log
-*.env
-
-# node / vite
+# frontend / build
 node_modules/
 dist/
 build/
+.vite/
 
-#project runtime
+# python envs / caches / packaging
+.venv/
+venv/
+env/
+ENV/
+__pycache__/
+*.py[cod]
+.mypy_cache/
+.pytest_cache/
+pip-wheel-metadata/
+*.egg-info/
 
-sessions/
-*.jsonl
+# ML artifacts / large files
+models/
+*.pt
+*.pth
+*.ckpt
+*.npz
 
-#os
+# runtime / secrets
+.env
+.env.*
 
-.DS.Store
+# notebooks
+.ipynb_checkpoints/
+
+# IDEs / editors
+.vscode/
+.idea/
+*.sublime-workspace
+
+# OS / temp
+.DS_Store
 Thumbs.db
+desktop.ini
+*.swp
+*~
