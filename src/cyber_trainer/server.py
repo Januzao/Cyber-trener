@@ -11,13 +11,20 @@ from typing import Any, Dict, List, Optional, Set
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 
+from .activity_gate import MotionGate
 from .config import AppConfig
 from .exercise_classifier import ExerciseClassifier
 from .features import compute_front_metrics, compute_side_metrics
+from .form_scoring import FormScoreTracker
 from .hinting import HintManager
 from .pose import PoseEstimator, PoseResult
 from .reps import DeadliftRepCounter
-from .rules_deadlift import DeadliftRuleEngine, Hint
+from .rules_biceps import BicepsRuleEngine
+from .rules_common import Hint as CommonHint
+from .rules_deadlift import DeadliftRuleEngine, Hint as DeadliftHint
+from .rules_lunge import LungeRuleEngine
+from .rules_pushup import PushupRuleEngine
+from .rules_squat import SquatRuleEngine
 from .summary import SessionSummary, save_summary
 from .video_stream import LatestFrameGrabber
 
@@ -43,10 +50,29 @@ def _pose_to_keypoints(pose: PoseResult) -> List[Dict[str, Any]]:
 
 # Which keypoints should be highlighted in UI for each issue.
 ISSUE_TO_ERRORS: Dict[str, List[str]] = {
+    # Deadlift
     "DL_BACK_NEUTRAL": ["left_shoulder", "right_shoulder", "left_hip", "right_hip"],
     "DL_EARLY_HIPS": ["left_hip", "right_hip", "left_knee", "right_knee"],
     "DL_BAR_CLOSE": ["left_wrist", "right_wrist", "left_ankle", "right_ankle"],
     "DL_KNEES_OVER_TOES": ["left_knee", "right_knee", "left_ankle", "right_ankle"],
+
+    # Squat
+    "SQ_BACK_NEUTRAL": ["left_shoulder", "right_shoulder", "left_hip", "right_hip"],
+    "SQ_KNEES_COLLAPSE": ["left_knee", "right_knee", "left_ankle", "right_ankle"],
+
+    # Lunge
+    "LU_KNEES": ["left_knee", "right_knee", "left_ankle", "right_ankle"],
+    "LU_LEAN": ["left_shoulder", "right_shoulder", "left_hip", "right_hip"],
+
+    # Pushups
+    "PU_SAG": ["left_shoulder", "right_shoulder", "left_hip", "right_hip"],
+    "PU_HIPS_HIGH": ["left_shoulder", "right_shoulder", "left_hip", "right_hip"],
+
+    # Biceps curls
+    "BI_FAST": ["left_wrist", "right_wrist", "left_elbow", "right_elbow"],
+    "BI_SWING": ["left_wrist", "right_wrist", "left_elbow", "right_elbow"],
+    "BI_TOP_ROM": ["left_wrist", "right_wrist", "left_elbow", "right_elbow"],
+    "BI_BOTTOM_ROM": ["left_wrist", "right_wrist", "left_elbow", "right_elbow"],
 }
 
 
@@ -58,6 +84,22 @@ def _severity_rank(sev: str) -> int:
     if sev == "info":
         return 1
     return 0
+
+
+def _hint_severity(h: Any) -> str:
+    return str(getattr(h, "severity", ""))
+
+
+def _hint_issue(h: Any) -> str:
+    return str(getattr(h, "issue_code", ""))
+
+
+def _hint_message(h: Any) -> str:
+    return str(getattr(h, "message", ""))
+
+
+def _hint_view(h: Any) -> str:
+    return str(getattr(h, "view", ""))
 
 
 class ConnectionManager:
@@ -94,9 +136,8 @@ class EngineThread(threading.Thread):
 
     - reads 2 MJPEG streams (front + side)
     - runs MediaPipe Pose
-    - classifies exercise (simple heuristics)
-    - runs deadlift rule engine (if deadlift)
-    - rep counting (deadlift)
+    - classifies/uses forced exercise selection
+    - runs rule engines for 5 exercises
     - publishes state snapshots for the UI
     """
 
@@ -113,12 +154,19 @@ class EngineThread(threading.Thread):
 
         self.classifier = ExerciseClassifier(min_visibility=cfg.min_pose_visibility)
 
-        # deadlift logic (thresholds + velocity gate)
-        self.deadlift_engine = DeadliftRuleEngine(
-            thr=cfg.thresholds,
-            lift_vel_px_s=cfg.lift_velocity_px_per_s,
-        )
+        # rule engines
+        self.deadlift_engine = DeadliftRuleEngine(thr=cfg.thresholds, lift_vel_px_s=cfg.lift_velocity_px_per_s)
+        self.squat_engine = SquatRuleEngine(frames_required=cfg.thresholds.frames_required)
+        self.lunge_engine = LungeRuleEngine(frames_required=cfg.thresholds.frames_required)
+        self.pushup_engine = PushupRuleEngine(frames_required=cfg.thresholds.frames_required)
+        self.biceps_engine = BicepsRuleEngine(frames_required=cfg.thresholds.frames_required)
+
+        # rep counting (kept for deadlift as in MVP)
         self.rep_counter = DeadliftRepCounter(lift_vel_px_s=cfg.lift_velocity_px_per_s)
+
+        # activity + score behavior (fix: score doesn't rise just from visibility)
+        self.motion_gate = MotionGate(min_vis=cfg.min_pose_visibility, active_frames=4, inactive_ms=900)
+        self.score_tracker = FormScoreTracker()
 
         # hinting (global rate-limit + per-issue cooldown)
         self.hint_mgr = HintManager(
@@ -131,10 +179,10 @@ class EngineThread(threading.Thread):
         self._ctrl_lock = threading.Lock()
         self._session_on: bool = True  # MVP: run immediately
         self._session_started_ms: Optional[int] = None
-        self._session_hints: List[Hint] = []
+        self._session_hints: List[Any] = []
 
         # UI hint persistence
-        self._active_hint: Optional[Hint] = None
+        self._active_hint: Optional[Any] = None
         self._active_hint_until_ms: int = 0
 
         # stop flag
@@ -166,6 +214,9 @@ class EngineThread(threading.Thread):
             self._active_hint = None
             self._active_hint_until_ms = 0
             self.rep_counter.reset()
+            self.motion_gate.reset()
+            self.score_tracker.reset()
+            self.biceps_engine.reset()
 
     def stop_session(self) -> Optional[str]:
         with self._ctrl_lock:
@@ -180,9 +231,27 @@ class EngineThread(threading.Thread):
             return path
 
     def set_exercise(self, name: Optional[str]) -> None:
-        # name: "deadlift" | "squat" | "plank" | None
+        # name: "deadlift" | "squat" | "lunge" | "pushups" | "biceps" | "plank" | None
         with self._ctrl_lock:
             self.classifier.set_forced(name)
+            # Reset gates so score starts only when you begin the new exercise
+            self.motion_gate.reset()
+            self.score_tracker.reset()
+            if name == "biceps":
+                self.biceps_engine.reset()
+
+    def _run_engines(self, ex_name: str, side_m, front_m) -> List[Any]:
+        if ex_name == "deadlift":
+            return self.deadlift_engine.update(side_m, front_m)
+        if ex_name == "squat":
+            return self.squat_engine.update(side_m, front_m)
+        if ex_name == "lunge":
+            return self.lunge_engine.update(side_m, front_m)
+        if ex_name == "pushups":
+            return self.pushup_engine.update(side_m, front_m)
+        if ex_name == "biceps":
+            return self.biceps_engine.update(side_m, front_m)
+        return []
 
     def run(self) -> None:
         self.front_thr.start()
@@ -222,26 +291,10 @@ class EngineThread(threading.Thread):
                     "session": {"on": self._session_on},
                     "exercise": {"name": "unknown", "confidence": 0.0, "mode": "auto"},
                     "views": {
-                        "front": {
-                            "ok": False,
-                            "avg_vis": 0.0,
-                            "keypoints": [],
-                            "errors": [],
-                            "frame_w": 0,
-                            "frame_h": 0,
-                            "mjpeg": self.cfg.front_url,
-                        },
-                        "side": {
-                            "ok": False,
-                            "avg_vis": 0.0,
-                            "keypoints": [],
-                            "errors": [],
-                            "frame_w": 0,
-                            "frame_h": 0,
-                            "mjpeg": self.cfg.side_url,
-                        },
+                        "front": {"ok": False, "avg_vis": 0.0, "keypoints": [], "errors": [], "frame_w": 0, "frame_h": 0, "mjpeg": self.cfg.front_url},
+                        "side": {"ok": False, "avg_vis": 0.0, "keypoints": [], "errors": [], "frame_w": 0, "frame_h": 0, "mjpeg": self.cfg.side_url},
                     },
-                    "form": {"status": "neutral", "message": "Waiting for camera streams...", "score": 0},
+                    "form": {"status": "neutral", "message": "Очікування потоків камер…", "score": 0},
                     "reps": asdict(self.rep_counter.state),
                 }
                 self.last_state = payload
@@ -252,7 +305,6 @@ class EngineThread(threading.Thread):
             front_pose = self.front_pose.infer(front_pkt.frame) if front_pkt is not None else PoseResult(False, 0.0, {})
             side_pose = self.side_pose.infer(side_pkt.frame) if side_pkt is not None else PoseResult(False, 0.0, {})
 
-            ts_ms = 0
             if side_pkt is not None:
                 ts_ms = side_pkt.ts_ms
             elif front_pkt is not None:
@@ -268,10 +320,17 @@ class EngineThread(threading.Thread):
             guess = self.classifier.classify(side_m, front_m)
             mode = "forced" if self.classifier.forced is not None else "auto"
 
-            # rules/hints
-            hints: List[Hint] = []
-            if self._session_on and guess.name == "deadlift":
-                hints = self.deadlift_engine.update(side_m, front_m)
+            # Decide which exercise we are actually evaluating
+            eval_ex = self.classifier.forced if self.classifier.forced is not None else guess.name
+
+            # Activity gate: score only when you start moving
+            act = self.motion_gate.update(eval_ex, side_m, front_m)
+            is_active = bool(self._session_on and act.active and eval_ex != "unknown")
+
+            # rules/hints: only when active (fix: no instant scoring on just standing)
+            hints: List[Any] = []
+            if is_active:
+                hints = self._run_engines(eval_ex, side_m, front_m)
 
             # store to session timeline
             if self._session_on and hints:
@@ -279,7 +338,7 @@ class EngineThread(threading.Thread):
 
             # choose most important hint for UI
             if hints:
-                top = max(hints, key=lambda h: _severity_rank(h.severity))
+                top = max(hints, key=lambda h: _severity_rank(_hint_severity(h)))
                 self._active_hint = top
                 self._active_hint_until_ms = ts_ms + 2500
 
@@ -290,50 +349,45 @@ class EngineThread(threading.Thread):
                 except Exception:
                     pass
 
-            # rep counting (only in deadlift)
-            if self._session_on and guess.name == "deadlift":
+            # rep counting (only in deadlift, as before)
+            if self._session_on and eval_ex == "deadlift":
                 self.rep_counter.update(side_m)
+
+            # Determine current active hint (persist a bit for UI)
+            active_hint = self._active_hint if (self._active_hint is not None and ts_ms <= self._active_hint_until_ms) else None
 
             # errors (highlight joints)
             errors: List[str] = []
-            hint_msg = ""
-            form_status = "neutral"
+            if active_hint is not None:
+                errors = ISSUE_TO_ERRORS.get(_hint_issue(active_hint), [])
 
-            active_hint = self._active_hint if (self._active_hint is not None and ts_ms <= self._active_hint_until_ms) else None
-
-            if not self._session_on:
-                form_status = "neutral"
-                hint_msg = "Session stopped."
-            elif not side_pose.ok and not front_pose.ok:
-                form_status = "neutral"
-                hint_msg = "Waiting for pose detection..."
-            elif active_hint is None:
-                form_status = "correct"
-                hint_msg = "Good form." if guess.name != "unknown" else "Analyzing..."
-            else:
-                hint_msg = active_hint.message
-                if active_hint.severity in ("warn", "critical"):
-                    form_status = "incorrect"
-                else:
-                    form_status = "neutral"
-
-                errors = ISSUE_TO_ERRORS.get(active_hint.issue_code, [])
-
-            # accuracy / score
+            # base visibility for scoring
             base_vis = 0.0
             if side_pose.ok:
                 base_vis = max(base_vis, side_pose.avg_vis)
             if front_pose.ok:
                 base_vis = max(base_vis, front_pose.avg_vis)
 
-            score = int(max(0.0, min(100.0, base_vis * 100.0)))
-            if active_hint is not None:
-                if active_hint.severity == "info":
-                    score = max(0, score - 10)
-                elif active_hint.severity == "warn":
-                    score = max(0, score - 20)
-                elif active_hint.severity == "critical":
-                    score = max(0, score - 35)
+            # UI messages when not active yet
+            if not self._session_on:
+                analyzing_msg = "Сесію зупинено."
+            elif eval_ex == "unknown":
+                analyzing_msg = "Вибери вправу (або увімкни forced режим) і стань повністю в кадр."
+            elif act.phase == "ready":
+                analyzing_msg = "Почни виконувати вправу — тоді почнеться оцінка техніки."
+            else:
+                analyzing_msg = "Почни виконувати вправу…"
+
+            hint_sev = _hint_severity(active_hint) if active_hint is not None else None
+            hint_msg = _hint_message(active_hint) if active_hint is not None else ""
+
+            score_state = self.score_tracker.update(
+                active=is_active,
+                base_vis=base_vis,
+                hint_severity=hint_sev,
+                hint_message=hint_msg,
+                analyzing_message=analyzing_msg,
+            )
 
             payload = {
                 "type": "state",
@@ -341,10 +395,12 @@ class EngineThread(threading.Thread):
                 "connected": True,
                 "session": {"on": bool(self._session_on)},
                 "exercise": {
-                    "name": str(guess.name),
+                    "name": str(eval_ex),
                     "confidence": float(guess.confidence),
                     "reason": str(guess.reason),
                     "mode": mode,
+                    "phase": act.phase,
+                    "motion_px_s": float(act.motion_px_s),
                 },
                 "views": {
                     "front": {
@@ -367,9 +423,9 @@ class EngineThread(threading.Thread):
                     },
                 },
                 "form": {
-                    "status": form_status,
-                    "message": hint_msg,
-                    "score": int(score),
+                    "status": score_state.status,
+                    "message": score_state.message,
+                    "score": int(score_state.score),
                 },
                 "reps": asdict(self.rep_counter.state),
             }
@@ -402,7 +458,6 @@ class RealtimeHub:
 
         def _put() -> None:
             assert self._queue is not None
-            # drop old states if queue is full (keep latency low)
             if self._queue.full():
                 try:
                     self._queue.get_nowait()
@@ -425,12 +480,11 @@ class RealtimeHub:
 cfg = AppConfig()
 app = FastAPI(title="Cyber-Trener Realtime API")
 
-# For local dev: React on :3000 -> backend on :8000
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
     allow_credentials=True,
-    allow_methods=["*"] ,
+    allow_methods=["*"],
     allow_headers=["*"],
 )
 
@@ -452,11 +506,7 @@ async def _shutdown() -> None:
 
 @app.get("/health")
 async def health() -> Dict[str, Any]:
-    return {
-        "ok": True,
-        "session_on": bool(hub.engine._session_on),
-        "forced_exercise": hub.engine.classifier.forced,
-    }
+    return {"ok": True, "session_on": bool(hub.engine._session_on), "forced_exercise": hub.engine.classifier.forced}
 
 
 @app.websocket("/ws")
@@ -473,8 +523,6 @@ async def websocket_endpoint(ws: WebSocket) -> None:
     try:
         while True:
             raw = await ws.receive_text()
-
-            # ignore empty keep-alive messages
             if not raw:
                 continue
 
@@ -524,24 +572,3 @@ async def websocket_endpoint(ws: WebSocket) -> None:
         await hub.manager.disconnect(ws)
     except Exception:
         await hub.manager.disconnect(ws)
-
-
-def main() -> None:
-    parser = argparse.ArgumentParser(description="Cyber-Trener realtime backend (WebSocket)")
-    parser.add_argument("--host", default="0.0.0.0")
-    parser.add_argument("--port", type=int, default=8000)
-    args = parser.parse_args()
-
-    import uvicorn
-
-    uvicorn.run(
-        "cyber_trainer.server:app",
-        host=args.host,
-        port=args.port,
-        reload=False,
-        log_level="info",
-    )
-
-
-if __name__ == "__main__":
-    main()

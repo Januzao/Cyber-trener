@@ -50,7 +50,7 @@ interface BackendState {
   };
 }
 
-type ExerciseMode = 'auto' | 'deadlift' | 'squat' | 'plank';
+type ExerciseMode = 'auto' | 'deadlift' | 'squat' | 'lunge' | 'pushups' | 'biceps';
 
 function getWsUrl(): string {
   // You can override in Vite via: VITE_WS_URL=ws://<ip>:8000/ws
@@ -254,7 +254,9 @@ export default function App() {
                 <option value="auto">Auto</option>
                 <option value="deadlift">Deadlift</option>
                 <option value="squat">Squat</option>
-                <option value="plank">Plank</option>
+                <option value="lunge">Lunge</option>
+                <option value="biceps">Biceps Curl</option>
+                <option value="pushups">Push-ups</option>
               </select>
             </div>
 
